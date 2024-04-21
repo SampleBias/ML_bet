@@ -1,0 +1,603 @@
+---
+title: "Daily Run for Baseball Picks"
+author: "James Utley PhD"
+date: '2024-04-06'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(retrosheet)
+library(baseballDBR)
+library(baseballr)
+library(splitstackshape)
+library(lubridate)
+library(tidyr)
+library(dplyr)
+library(stringr)
+library(xgboost)
+library(SHAPforxgboost)
+library(zoo)
+library(caret)
+library(skimr)
+library(readr)
+library(tidyverse)
+```
+
+```{r}
+# Define the teams vector
+teams <- c("NYM", "CHC", "ATL", "CIN", "SLN", "LAA", "BAL", "MIN", "OAK", "TEX", "TOR", "ARI", "PIT", "SEA", "HOU", "KCR", "TBR", "COL", "MIL", "PHI", "SDN", "SFN", "BOS", "DET", "NYA", "LAD", "CHW", "CLE", "WSH", "MIA")
+
+# Define the chunk size for retrieving data in smaller subsets
+chunk_size <- 11
+team_chunks <- split(teams, ceiling(seq_along(teams) / chunk_size))
+
+# Initialize an empty data frame to store the results
+mlb_results <- data.frame()
+# Retrieve data for each chunk of teams
+for (chunk in team_chunks) {
+  for (team in chunk) {
+    season_results <- tryCatch({
+      bref_team_results(Tm = team, year = 2023)
+    }, error = function(e) {
+      message(paste("Error retrieving data for team:", team, "; Error:", e$message))
+      NULL  # Return NULL on error
+    })
+    if (!is.null(season_results)) {
+      mlb_results <- rbind(mlb_results, season_results)
+    }
+  }
+  gc()  # Suggest garbage collection at each iteration
+}
+
+```
+
+```{r}
+# Feature Engineering Unique ID
+options(dplyr.summarise.inform = FALSE)
+
+# Convert the 'Date' column to a character vector
+mlb_results$Date <- as.character(mlb_results$Date)
+
+# Split the 'Date' column
+all_games_eng <- cSplit(mlb_results, 'Date', sep = ", ", type.convert = FALSE)
+all_games_eng <- cSplit(all_games_eng, 'Date_2', sep = " \\(", type.convert = FALSE)
+all_games_eng <- cSplit(all_games_eng, 'Date_2_1', sep = " ", type.convert = FALSE)
+
+# Convert the 'Date_2_1_1' column to numeric using match()
+all_games_eng$Date_2_1_1 <- match(all_games_eng$Date_2_1_1, month.abb)
+
+# Convert the 'Date_2_1_2' column to numeric
+all_games_eng$Date_2_1_2 <- as.numeric(gsub("[^0-9]", "", all_games_eng$Date_2_1_2))
+
+# Create consistent team names
+all_games_eng <- all_games_eng %>%
+  mutate(Tm = recode(Tm, "ANA" = "LAA", "FLA" = "MIA", "MON" = "WSN", "TBD" = "TBR"))
+all_games_eng <- all_games_eng %>%
+  mutate(Opp = recode(Opp, "ANA" = "LAA", "FLA" = "MIA", "MON" = "WSN", "TBD" = "TBR"))
+
+all_games_eng$ID <- ifelse(all_games_eng$H_A == "H",
+  paste0(all_games_eng$Year, "_", all_games_eng$Date_2_1_1, "_", all_games_eng$Date_2_1_2, "_", all_games_eng$Tm, "_", all_games_eng$Opp),
+  paste0(all_games_eng$Year, "_", all_games_eng$Date_2_1_1, "_", all_games_eng$Date_2_1_2, "_", all_games_eng$Opp, "_", all_games_eng$Tm)
+)
+all_games_eng$TmWin <- ifelse(all_games_eng$R > all_games_eng$RA, 1, 0)
+all_games_eng$TmID <- paste0(all_games_eng$Year, "_", all_games_eng$Gm, "_", all_games_eng$Tm)
+all_games_eng$GmDate <- ymd(paste(all_games_eng$Year, mlb_results$Date, sep = ""))
+all_games_eng$OppID <- paste0(all_games_eng$Year, "_", all_games_eng$Gm, "_", all_games_eng$Opp)
+
+# Remove ties
+all_games_eng <- all_games_eng[!(all_games_eng$Result == "T"), ]
+
+# Create vector of columns that have NA values
+unneces_and_na <- names(which(colSums(is.na(all_games_eng)) > 0))
+
+# Remove columns that are unnecessary with NA values
+all_games_eng <- select(all_games_eng, -all_of(unneces_and_na))
+```
+
+```{r Feature Engineering Season Runs Tm}
+# Calculate cumulative runs for each team
+all_games_eng <- all_games_eng %>%
+  group_by(Tm, Year) %>%
+  mutate(Tm_Game_Runs_For = cumsum(R),
+         Tm_Game_Runs_Against = cumsum(RA),
+         Tm_Game_Runs_For_Lag = lag(Tm_Game_Runs_For, default = 0),
+         Tm_Game_Runs_Against_Lag = lag(Tm_Game_Runs_Against, default = 0)) %>%
+  ungroup()
+
+# Calculate cumulative runs for each opponent
+all_games_eng <- all_games_eng %>%
+  group_by(Opp, Year) %>%
+  mutate(Opp_Runs_For = cumsum(R),
+         Opp_Runs_Against = cumsum(RA),
+         Opp_Runs_For_Lag = lag(Opp_Runs_For, default = 0),
+         Opp_Runs_Against_Lag = lag(Opp_Runs_Against, default = 0)) %>%
+  ungroup()
+
+# Calculate Pythag values and Pythagdelta
+all_games_eng$TmPythag <- all_games_eng$Tm_Game_Runs_For_Lag^1.83 /
+  (all_games_eng$Tm_Game_Runs_For_Lag^1.83 + all_games_eng$Tm_Game_Runs_Against_Lag^1.83)
+
+all_games_eng$OppPythag <- all_games_eng$Opp_Runs_For_Lag^1.83 /
+  (all_games_eng$Opp_Runs_Against_Lag^1.83 + all_games_eng$Opp_Runs_For_Lag^1.83)
+
+all_games_eng$Pythagdelta <- all_games_eng$TmPythag - all_games_eng$OppPythag
+```
+
+```{r Remove Duplicate Columns as a result of joins}
+# Remove duplicate columns explicitly
+all_games_eng <- all_games_eng %>%
+  select(-ends_with(".y"),
+         -matches("^Tm_Game_Runs_For\\.x$"),
+         -matches("^Tm_Game_Runs_Against\\.x$"),
+         -matches("^Opp_Runs_For\\.x$"),
+         -matches("^Opp_Runs_Against\\.x$")) %>%
+  distinct()
+
+# Rename 'Tm' to 'Opponent'
+names(all_games_eng)[names(all_games_eng) == 'Tm'] <- "Opponent"
+
+# Remove '.x' suffix from remaining column names
+all_games_eng <- all_games_eng %>%
+  rename_with(~str_remove(., '\\.x$'))
+```
+
+```{r Create column to count wins and losses to dervive Log 5}
+#create df similar to season runs to parse the record column
+all_games_eng$Result<-ifelse(all_games_eng$Result == "L-wo", "L", 
+                      ifelse(all_games_eng$Result == "L &H", "L",
+                       ifelse(all_games_eng$Result == "L &V", "L",
+                       ifelse(all_games_eng$Result == "L &X", "L", 
+                       ifelse(all_games_eng$Result == "W &H", "W",
+                       ifelse(all_games_eng$Result == "W &V", "W",
+                       ifelse(all_games_eng$Result == "W-wo", "W",
+                       ifelse(all_games_eng$Result == "W &X", "W",
+                       ifelse(all_games_eng$Result == "W", "W",
+                       ifelse(all_games_eng$Result == "L", "L",
+                        "FIX"))))))))))
+all_games_eng$wins<-ifelse(all_games_eng$Result == "W",1,0)
+all_games_eng$loss<-ifelse(all_games_eng$Result == "L", 1,0)
+```
+
+```{r Feature Engineering Season Runs Tm}
+# Function to rename duplicated columns uniquely
+rename_duplicated <- function(df) {
+  names(df) <- make.unique(names(df))
+  return(df)
+}
+
+# Initial cleaning with unique name assurance
+temp_df <- all_games_eng %>%
+  select(-ends_with(".y")) %>%
+  distinct() %>%
+  rename_duplicated()
+
+# Remove '.x' suffix from remaining column names, ensuring names remain unique
+temp_df <- temp_df %>%
+  rename_with(~str_remove(., '\\.x$')) %>%
+  rename_duplicated()
+
+# Remove unnecessary columns
+temp_df <- temp_df %>%
+  select(-matches("^Tm_Game_Runs_For$"),
+         -matches("^Tm_Game_Runs_Against$"),
+         -matches("^Opp_Runs_For$"),
+         -matches("^Opp_Runs_Against$"))
+
+# Ensure "Opponent" column does not exist before creating/modifying it
+if("Opponent" %in% names(temp_df)) {
+  temp_df <- temp_df %>% select(-Opponent)
+}
+
+# Create a new "Opponent" column based on "Tm" if it exists, else use NA
+if ("Tm" %in% names(all_games_eng)) {
+  temp_df$Opponent <- all_games_eng$Tm
+} else {
+  temp_df$Opponent <- NA  # Adjusted to handle the absence of "Tm"
+}
+
+# Calculate cumulative wins and losses for each team
+temp_df <- temp_df %>%
+  group_by(Opponent, Year) %>%
+  mutate(Tm_Wins = cumsum(wins),
+         Tm_Losses = cumsum(loss),
+         Tm_Wins_Lag = lag(Tm_Wins, default = 0),
+         Tm_Losses_Lag = lag(Tm_Losses, default = 0)) %>%
+  ungroup()
+
+# Calculate cumulative wins and losses for each opponent
+temp_df <- temp_df %>%
+  group_by(Opp, Year) %>%
+  mutate(Opp_Wins = cumsum(wins),
+         Opp_Losses = cumsum(loss),
+         Opp_Wins_Lag = lag(Opp_Wins, default = 0),
+         Opp_Losses_Lag = lag(Opp_Losses, default = 0)) %>%
+  ungroup()
+
+# Calculate win percentages, adding a small number to avoid division by zero
+temp_df$Tm_WinPct <- temp_df$Tm_Wins_Lag / (temp_df$Tm_Wins_Lag + temp_df$Tm_Losses_Lag + 1e-9)
+temp_df$Opp_WinPct <- temp_df$Opp_Wins_Lag / (temp_df$Opp_Wins_Lag + temp_df$Opp_Losses_Lag + 1e-9)
+
+# Assign the modified data frame back to all_games_eng
+all_games_eng <- temp_df
+
+# Optionally, remove the temporary dataframe if you wish
+rm(temp_df)
+
+```
+
+```{r Remove 50 games with NA Values for Opp Runs for, against, and Pythag}
+# Ensure that NA values are handled before computing max for TmUnobsSkillLvl and OppUnobsSkillLvl
+# You might need to replace NA values with 0 or another placeholder if applicable
+all_games_cln$TmUnobsSkillLvl[is.na(all_games_cln$TmUnobsSkillLvl)] <- 0
+all_games_cln$OppUnobsSkillLvl[is.na(all_games_cln$OppUnobsSkillLvl)] <- 0
+
+# Calculate max values while ensuring there are finite values; default to 0 if none found
+maxTmUnobs <- ifelse(any(is.finite(all_games_cln$TmUnobsSkillLvl)), 
+                     max(all_games_cln$TmUnobsSkillLvl[is.finite(all_games_cln$TmUnobsSkillLvl)]), 
+                     0)
+maxOppUnobs <- ifelse(any(is.finite(all_games_cln$OppUnobsSkillLvl)), 
+                      max(all_games_cln$OppUnobsSkillLvl[is.finite(all_games_cln$OppUnobsSkillLvl)]), 
+                      0)
+
+# Replace "Inf" with max value of column
+all_games_cln$TmUnobsSkillLvl <- ifelse(is.finite(all_games_cln$TmUnobsSkillLvl), 
+                                        all_games_cln$TmUnobsSkillLvl, 
+                                        maxTmUnobs)
+all_games_cln$OppUnobsSkillLvl <- ifelse(is.finite(all_games_cln$OppUnobsSkillLvl), 
+                                         all_games_cln$OppUnobsSkillLvl, 
+                                         maxOppUnobs)
+
+# Handle NaN values for ProbOfTmWin; NaN can result from division by zero or other invalid operations
+all_games_cln$ProbOfTmWin <- ifelse(is.nan(all_games_cln$ProbOfTmWin), 
+                                    0, 
+                                    all_games_cln$ProbOfTmWin)
+all_games_cln$ProbofOppWin <- 1 - all_games_cln$ProbOfTmWin
+
+```
+
+```{r}
+# Assuming all_games_cln is your starting dataframe
+# Make column names unique to prevent issues with rename_with()
+all_games_cln <- all_games_cln %>%
+  rename_with(~make.unique(.))
+# Rename 'TmID' to 'Tm'
+all_games_cln <- all_games_cln %>%
+  rename(Tm = TmID)
+# Check if 'Tm' column exists before grouping; adjust this snippet according to your dataframe's structure
+if(!"Tm" %in% names(all_games_cln)) {
+  # If 'Tm' does not exist, consider whether it has been renamed or needs to be created from another column
+  # This is a placeholder action; you'll need to adapt it based on your specific scenario
+  # For example, if 'Tm' was supposed to be renamed from 'Team', you would uncomment and adjust the following:
+  # all_games_cln <- all_games_cln %>%
+  #   rename(Tm = Team) # Adjust 'Team' to the actual original name of 'Tm' if it was renamed
+}
+
+# Now, attempt to group by 'Tm' and 'Year', ensuring 'Tm' exists
+# This code chunk assumes 'Tm' now exists in your dataframe
+if("Tm" %in% names(all_games_cln) && "Year" %in% names(all_games_cln)) {
+  all_games_cln <- all_games_cln %>%
+    group_by(Tm, Year) %>%
+    # Continue with your intended operations here
+    ungroup() # Remember to ungroup if you're done with grouped operations
+} else {
+  # If 'Tm' or 'Year' are still not found, print a message for debugging
+  print("Column 'Tm' or 'Year' not found in dataframe.")
+}
+
+```
+
+```{r Rolling Log 5}
+k <- 6
+
+# Assuming 'all_games_cln' is your dataframe and 'wins' and 'loss' are columns within it
+# Here's how the revised block of code using `reframe()` would look:
+
+RollingLog5 <- all_games_cln %>%
+  group_by(Tm, Year) %>%
+  mutate(TmID = paste(Year, Gm, Tm, sep = "_"),
+         RollingTmWins = rollapply(wins, width = k, FUN = sum, partial = TRUE, align = "right") - wins,
+         RollingTmLosses = rollapply(loss, width = k, FUN = sum, partial = TRUE, align = "right") - loss,
+         RollingTmWinPct = RollingTmWins / (RollingTmWins + RollingTmLosses),
+         RollingTmUnObs = RollingTmWinPct / (2 * 1 - RollingTmWinPct))
+
+# Adjusting 'RollingOppLog5' computation to use `reframe()` instead of `summarise()`
+RollingOppLog5 <- RollingLog5 %>%
+  group_by(Tm, Year) %>%
+  reframe(OppID = paste(Year, Gm, Tm, sep = "_"),
+          RollingOppWins = rollapply(wins, width = k, FUN = sum, partial = TRUE, align = "right") - wins,
+          RollingOppLosses = rollapply(loss, width = k, FUN = sum, partial = TRUE, align = "right") - loss,
+          RollingOppWinPct = RollingOppWins / (RollingOppWins + RollingOppLosses),
+          .by_group = FALSE) # Ensure it's ungrouped if needed
+
+# Joining 'RollingOppLog5' with 'RollingLog5'
+RollingLog5 <- RollingLog5 %>%
+  left_join(RollingOppLog5, by = "OppID")
+
+# Adjusting the select statement to remove unnecessary columns
+RollingLog5 <- select(RollingLog5, -ends_with(".y"))
+
+# Calculating probabilities
+RollingLog5 <- RollingLog5 %>%
+  mutate(RollingProbofTmWin = RollingTmUnObs / (RollingTmUnObs + RollingOppUnObs),
+         RollingProbofOppWin = 1 - RollingProbofTmWin) %>%
+  rename_with(~str_remove(., '.x'))
+
+# Note: Ensure 'Gm', 'wins', and 'loss' columns exist in your 'all_games_cln' data frame
+
+```
+
+```{r Add Rolling 5 Pythag and Log 5 for Tm}
+k <- 6
+
+# Assuming wins and loss columns exist and are intended for per-row calculations
+RollingLog5 <- all_games_cln %>%
+  group_by(Tm, Year) %>%
+  mutate(
+    TmID = paste(Year, Gm, Tm, sep = "_"),
+    RollingTmWins = rollapply(wins, width = k, FUN = sum, partial = TRUE, align = "right") - wins,
+    RollingTmLosses = rollapply(loss, width = k, FUN = sum, partial = TRUE, align = "right") - loss,
+    RollingTmWinPct = RollingTmWins / (RollingTmWins + RollingTmLosses),
+    RollingTmUnObs = RollingTmWinPct / (2 * 1 - RollingTmWinPct)
+  ) %>%
+  ungroup()
+
+# RollingOppLog5 calculation seems redundant or misapplied since it repeats the calculations on the same groupings
+# For demonstration, it's merged back directly without creating a separate dataframe. Adjust if the logic differs.
+
+RollingLog5 <- RollingLog5 %>%
+  left_join(RollingLog5 %>% select(Tm, Year, Gm, TmID, RollingTmWins, RollingTmLosses, RollingTmWinPct, RollingTmUnObs), by = "TmID", suffix = c("", ".Opp"))
+
+# Clean up unwanted columns, assuming the suffix addition above was to differentiate between team and opponent metrics
+RollingLog5 <- RollingLog5 %>%
+  select(-ends_with(".y"))
+
+RollingLog5 <- RollingLog5 %>%
+  mutate(
+    RollingProbofTmWin = RollingTmUnObs / (RollingTmUnObs + RollingTmUnObs.Opp),
+    RollingProbofOppWin = 1 - RollingProbofTmWin
+  )
+
+# Assuming any '.x' in column names was from previous join attempts, remove them
+RollingLog5 <- RollingLog5 %>%
+  rename_with(~str_remove(., '\\.x$'))
+
+
+```
+
+```{r Create Rolling k Pythag Records from Runs for and against}
+
+Rolling5_Tm_Runs$Tm5DayPythag<-Rolling5_Tm_Runs$Rolling5_Tm_Game_Runs_For^1.83 / (Rolling5_Tm_Runs$Rolling5_Tm_Game_Runs_For^1.83 + Rolling5_Tm_Runs$Rolling5_Tm_Game_Runs_Against^1.83)
+
+Rolling5_Tm_Runs$Opp5Pythag<-Rolling5_Tm_Runs$Rolling5_Opp_Game_Runs_For^1.83 / (Rolling5_Tm_Runs$Rolling5_Opp_Game_Runs_Against^1.83 + Rolling5_Tm_Runs$Rolling5_Opp_Game_Runs_For^1.83)
+
+Rolling5_Tm_Runs$Pythag5delta<-Rolling5_Tm_Runs$Tm5DayPythag - Rolling5_Tm_Runs$Opp5Pythag
+```
+
+```{r Remove Unncessary Variables and Convert all to Numeric}
+unnecessary_vars_odds <- c("Gm", "Result", "Record", "Opponent", "Rank", "GB", "Win", "Loss", "Time", "D/N", "Streak", "Date_1", "Date_2_1_1", "Date_2_1_2", "wins", "loss", "TmID", "OppID", "TmUnobsSkillLvl", "OppUnobsSkillLvl", "RollingTmUnObs", "RollingOppUnObs", "R", "RA", "Tm", "Opp")
+
+# Assuming 'Rolling5_Tm_Runs' is your dataframe and you want to drop the unnecessary_vars_odds if they exist
+prelim_model_season_and_5_data <- select(Rolling5_Tm_Runs, -any_of(unnecessary_vars_odds))
+
+# Convert/remove all non-numeric variables as XGBoost can only handle numeric
+prelim_model_season_and_5_data$H_A <- ifelse(prelim_model_season_and_5_data$H_A == "H", 1, 0)
+
+# Remove NA values for games with odds (playoffs) but no game information
+prelim_model_season_and_5_data <- na.omit(prelim_model_season_and_5_data)
+
+```
+
+```{r Split Home and Away to create game as a single observation}
+hm<- prelim_model_season_and_5_data[prelim_model_season_and_5_data$H_A ==1, ]
+away<-prelim_model_season_and_5_data[prelim_model_season_and_5_data$H_A ==0, ]
+
+model_data<-hm%>%
+  left_join(away, by = "ID")
+
+model_data <- model_data %>% 
+  rename_at(
+    vars(ends_with(".x")),
+    ~str_replace(., "\\..$","")
+  ) %>% 
+  select_at(
+    vars(-ends_with(".y"))
+  )
+
+model_data<-select(model_data, -c(ID))
+```
+
+```{r Manually Input Data for Day's Games}
+#opp is away and Tm is home
+opp<-c("LAA", "NYY", "ARI","CHC", "DET", "KCR", "TBR", "MIN", "PHI", "TOR", "COL")
+Tm<-c("OAK", "TEX", "MIL","CIN", 'SEA', 'CLE',  'BOS', 'CHW', 'HOU', "BAL", "LAD")
+Opp_odds<-c(-225,-115, 139, -125, 122, 144, 115, 100, 153, 134, 255)
+Tm_odds<-c(185, -105, -165, 105,-145, -175, -138, -120, -185, -160, -320)
+```
+
+```{r}
+# Split the "Record" column into "Wins" and "Losses"
+mlb_results <- mlb_results %>%
+  separate(Record, into = c("Wins", "Losses"), sep = "-", convert = TRUE)
+
+# Now, proceed to summarize 'mlb_results' for 'model_input'
+model_input <- mlb_results %>%
+  group_by(Tm) %>%
+  summarise(
+    Tm_Game_Runs_For = sum(R),
+    Tm_Runs_Against = sum(RA),
+    Rolling_5_Runs_For = sum(tail(R, n = 5)),
+    Rolling_5_Runs_Against = sum(tail(RA, n = 5)),
+    Wins = max(Wins),  # Assumes 'Wins' now correctly reflects cumulative wins
+    Losses = max(Losses),  # Assumes 'Losses' now correctly reflects cumulative losses
+    Games = n(),  # Count of games played; replaces 'max(Gm)' if 'Gm' isn't a simple game counter
+    .groups = 'drop'  # Drop the grouping
+  )
+
+```
+
+```{r Create Data Frame from Data Entry and Data Calculations}
+# Assuming 'Tm', 'opp', 'Tm_odds', and 'Opp_odds' are already defined and available
+tms_and_odds <- data.frame(Tm, opp, Tm_odds, Opp_odds)
+
+# Add home team info to season-long and rolling 5 team data
+tm_and_odds <- left_join(tms_and_odds, model_input %>% 
+                           select(Tm, Tm_Game_Runs_For, Tm_Runs_Against, 
+                                  Rolling_5_Runs_For, Rolling_5_Runs_Against,
+                                  Wins, Losses), by = "Tm")
+
+# Add visiting team info to season-long and rolling 5 team data
+both_tms_and_odds <- left_join(tm_and_odds, model_input %>% 
+                                 rename(opp = Tm) %>%
+                                 select(opp, Tm_Game_Runs_For, Tm_Runs_Against,
+                                        Rolling_5_Runs_For, Rolling_5_Runs_Against, 
+                                        Wins, Losses), by = "opp") %>%
+  distinct()
+
+# Since tm is home, H_A will always be 1
+both_tms_and_odds$H_A <- 1
+
+# Create Pythagorean win expectation records for the team and opponent
+both_tms_and_odds <- both_tms_and_odds %>%
+  mutate(TmPythag = Tm_Game_Runs_For.x / (Tm_Game_Runs_For.x + Tm_Runs_Against.x),
+         OppPythag = Tm_Game_Runs_For.y / (Tm_Game_Runs_For.y + Tm_Runs_Against.y),
+         Pythagdelta = TmPythag - OppPythag)
+
+# Create win percentages for the team and opponent
+both_tms_and_odds <- both_tms_and_odds %>%
+  mutate(Tm_WinPct = Wins.x / (Wins.x + Losses.x),
+         Opp_WinPct = Wins.y / (Wins.y + Losses.y))
+
+# Calculate the unobserved skill level and probability of the team winning based on Log5 method
+both_tms_and_odds <- both_tms_and_odds %>%
+  mutate(TmUnobsSkillLvl = Tm_WinPct / (2 * (1 - Tm_WinPct)),
+         OppUnobsSkillLvl = Opp_WinPct / (2 * (1 - Opp_WinPct)),
+         ProbofTmWin = TmUnobsSkillLvl / (TmUnobsSkillLvl + OppUnobsSkillLvl))
+
+# Define new column names based on the provided column names from 'both_tms_and_odds'
+name <- c(
+  "TeamOdds", "OpponentOdds", 
+  "TeamGameRunsFor", "TeamRunsAgainst", 
+  "TeamRolling5RunsFor", "TeamRolling5RunsAgainst",
+  "TeamWins", "TeamLosses",
+  "OpponentGameRunsFor", "OpponentRunsAgainst", 
+  "OpponentRolling5RunsFor", "OpponentRolling5RunsAgainst",
+  "OpponentWins", "OpponentLosses", 
+  "HomeAway", 
+  "TeamPythagorean", "OpponentPythagorean", "PythagoreanDelta", 
+  "TeamWinPercentage", "OpponentWinPercentage", 
+  "TeamUnobservedSkillLevel", "OpponentUnobservedSkillLevel", 
+  "ProbabilityOfTeamWin"
+)
+
+# Rename columns in 'both_tms_and_odds' using 'name'
+colnames(both_tms_and_odds) <- name
+
+# 'test_data' now refers to the final processed dataframe after renaming
+test_data <- both_tms_and_odds
+
+# At this point, 'test_data' has been updated with new column names and is ready for further analysis or export.
+
+```
+
+```{r Run Model on data}
+# Clean column names if any are NA or empty strings
+colnames(test_data) <- make.names(colnames(test_data), unique = TRUE)
+
+# Convert character columns to factors, then to numeric. 
+# This step carefully handles character to factor to integer conversion.
+test_data <- test_data %>%
+  mutate(across(where(is.character), ~as.integer(as.factor(.))))
+
+# Alternatively, handle specific known character columns manually if automatic conversion is problematic
+# test_data$SomeCharacterColumn <- as.integer(as.factor(test_data$SomeCharacterColumn))
+
+# Now prepare the DMatrix
+# Check that no columns are character type to ensure as.matrix will work correctly
+if(any(sapply(test_data, is.character))) {
+  stop("Some columns are still character type.")
+}
+
+xgb_pred_DMatrix <- xgb.DMatrix(data = as.matrix(test_data))
+
+# Assuming 'xgb3' is your trained model loaded in the session
+# Ensure that 'xgb3' is available and is a trained XGBoost model
+# pred_hm_win <- round(predict(xgb3, xgb_pred_DMatrix, type = 'prob'), 2)
+
+```
+
+```{r Add Contextual information to model output}
+library(ggplot2)
+
+# Remove columns with names "NA." and "NA..1" from 'test_data'
+test_data <- test_data[, !(names(test_data) %in% c("NA.", "NA..1"))]
+
+# Function to ensure binary transformation
+ensureBinary <- function(probability) {
+  ifelse(probability > 0.5, 1, 0)
+}
+
+# Ensure 'ProbabilityOfTeamWin' is binary
+test_data$ProbabilityOfTeamWin <- ensureBinary(test_data$ProbabilityOfTeamWin)
+
+# Handling missing or infinite values before model training
+test_data <- na.omit(test_data)
+test_data <- test_data[!apply(test_data, 1, function(x) any(is.infinite(x))), ]
+
+# Train the model on the updated 'test_data'
+model <- glm(ProbabilityOfTeamWin ~ ., data = test_data, family = binomial(link = "logit"))
+
+# Attempt to convert odds to numeric and handle potential conversion errors
+convertToNumeric <- function(column) {
+  as.numeric(as.character(column))
+}
+
+both_tms_and_odds$TeamOdds <- suppressWarnings(convertToNumeric(both_tms_and_odds$TeamOdds))
+both_tms_and_odds$OpponentOdds <- suppressWarnings(convertToNumeric(both_tms_and_odds$OpponentOdds))
+
+# Print the dimensions of 'both_tms_and_odds'
+cat("Dimensions of 'both_tms_and_odds':", dim(both_tms_and_odds), "\n")
+
+# Prediction
+pred_hm_win <- predict(model, newdata = both_tms_and_odds[, predictor_columns], type = "response")
+
+# Visualization of the predicted probabilities
+ggplot(both_tms_and_odds, aes(x = pred_hm_win)) +
+  geom_histogram(binwidth = 0.05, fill = "blue", color = "white") +
+  theme_minimal() +
+  labs(title = "Distribution of Predicted Home Team Win Probabilities", x = "Predicted Probability", y = "Count")
+
+# Ensure the script continues even if there are errors in conversion or visualization
+tryCatch({
+  # Further data processing and calculation steps
+}, error = function(e) {
+  cat("An error occurred: ", e$message, "\n")
+})
+
+# Example visualization to explore relationship between a predictor and the target variable
+# Replace 'TeamOdds' with any predictor of interest
+ggplot(test_data, aes(x = TeamOdds, y = ProbabilityOfTeamWin)) +
+  geom_point(aes(color = ProbabilityOfTeamWin)) +
+  theme_dark() +
+  labs(title = "Relationship between Team Odds and Win Probability", x = "Team Odds", y = "Win Probability")
+
+# Note: Replace placeholder steps with actual calculations as needed.
+
+```
+
+```{r Create Value Threshold}
+pred_hm_win <- predict(model, newdata = both_tms_and_odds[c(1:4)], type = "response")
+baseballpred <- cbind(both_tms_and_odds[c(1:4)], pred_hm_win)
+#set how big you want the difference between should be and actual odds
+value_thresh<- 100
+picks<- baseballpred%>%
+  filter(HomeValue > value_thresh | VisValue >value_thresh)
+#show best picks
+picks
+#show all picks
+baseballpred
+
+```
